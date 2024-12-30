@@ -5,10 +5,17 @@ from re import compile as regex_compile, IGNORECASE as regex_IGNORECASE, MULTILI
 from requests import Session, packages, adapters
 from requests.adapters import TimeoutSauce
 from requests.exceptions import Timeout
+from multiprocessing import Pool, cpu_count
+import os
+import warnings
+import urllib3
+warnings.simplefilter('ignore', urllib3.exceptions.InsecureRequestWarning)
 
 MAX_TIMEOUT_SECONDS = 6
 DOMAINS_FILE = 'domains.txt'
 INCLUDE_SUBDOMAINS = False
+# Number of processes to use (default to CPU count)
+MAX_PROCESSES = cpu_count()
 
 class CustomTimeout(TimeoutSauce):
     def __init__(self, *args, **kwargs):
@@ -350,47 +357,77 @@ def get_iana_tlds(regex_href):
   
   return False
   
+def process_single_domain(args):
+    """Wrapper function to handle single domain processing for multiprocessing"""
+    domain, regex_pattern, regex_robots, regex_href, headers, tlds = args
+    try:
+        result = parse_domain(domain, regex_pattern, regex_robots, regex_href, headers, tlds)
+        return domain, result
+    except Exception as e:
+        print(f"[-] Error processing domain {domain}: {str(e)}")
+        return domain, False
+
 def main():
-  
-  try:
-    with open(DOMAINS_FILE, 'r') as f:
-      domains = f.read().splitlines()
-  except FileNotFoundError:
-    print(f'[-] File {DOMAINS_FILE} not found!')
-    return
-  except PermissionError:
-    print(f'[-] Insufficient permission to read {DOMAINS_FILE}!')
-    return
-  
-  if len(domains) == 0:
-    print(f'[-] File {DOMAINS_FILE} is empty!')
-    return
-  
-  unique_domains = set()
-  
-  for domain in domains:
-    if '.' in domain:
-      unique_domains.add(domain)
+    try:
+        with open(DOMAINS_FILE, 'r') as f:
+            domains = f.read().splitlines()
+    except FileNotFoundError:
+        print(f'[-] File {DOMAINS_FILE} not found!')
+        return
+    except PermissionError:
+        print(f'[-] Insufficient permission to read {DOMAINS_FILE}!')
+        return
     
-  if len(unique_domains) == 0:
-    print(f'[-] File {DOMAINS_FILE} contains no domains!')
-    return
-  
-  packages.urllib3.disable_warnings()
-  regex_pattern = regex_compile("\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b", regex_IGNORECASE) #regular-expressions.info/email.html
-  regex_robots = regex_compile("^Disallow[ ]*:(.*)", regex_MULTILINE)
-  regex_href = regex_compile("<a\\s+(?:[^>]*?\\s+)?href=([\"'])(.*?)\\1")
-  
-  tlds = get_iana_tlds(regex_href)
-  
-  for domain in unique_domains:
-    parse_domain(domain, regex_pattern, regex_robots, regex_href, get_headers(), tlds)
-  
-  return
-  
-   
+    if len(domains) == 0:
+        print(f'[-] File {DOMAINS_FILE} is empty!')
+        return
+    
+    unique_domains = set()
+    for domain in domains:
+        if '.' in domain:
+            unique_domains.add(domain)
+    
+    if len(unique_domains) == 0:
+        print(f'[-] File {DOMAINS_FILE} contains no domains!')
+        return
+    
+    packages.urllib3.disable_warnings()
+    regex_pattern = regex_compile("\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b", regex_IGNORECASE)
+    regex_robots = regex_compile("^Disallow[ ]*:(.*)", regex_MULTILINE)
+    regex_href = regex_compile("<a\\s+(?:[^>]*?\\s+)?href=([\"'])(.*?)\\1")
+    
+    tlds = get_iana_tlds(regex_href)
+    
+    # Prepare arguments for parallel processing
+    process_args = []
+    headers = get_headers()  # Get headers once
+    
+    for domain in unique_domains:
+        args = (domain, regex_pattern, regex_robots, regex_href, headers, tlds)
+        process_args.append(args)
+    
+    print(f"[+] Starting parallel processing with {MAX_PROCESSES} processes")
+    
+    # Create process pool and run domains in parallel
+    with Pool(processes=MAX_PROCESSES) as pool:
+        results = pool.map(process_single_domain, process_args)
+    
+    # Process results
+    successful = 0
+    failed = 0
+    for domain, result in results:
+        if result:
+            successful += 1
+        else:
+            failed += 1
+    
+    print(f"\n[+] Processing complete:")
+    print(f"[+] Successfully processed: {successful} domains")
+    print(f"[-] Failed to process: {failed} domains")
+
 if __name__ == "__main__":
-  try:
-      main()
-  except KeyboardInterrupt:
-    exit("Bye")
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[-] Interrupted by user")
+        exit(1)
