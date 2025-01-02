@@ -6,6 +6,10 @@ from requests import Session, packages, adapters
 from requests.adapters import TimeoutSauce
 from requests.exceptions import Timeout
 from multiprocessing import Pool, cpu_count
+import dns.resolver
+import smtplib
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import warnings
 import urllib3
@@ -212,9 +216,59 @@ def get_page_links(base_url:str, domain:str, resp, disallowed:tuple, regex_href)
   
   return list(links)
 
+def verify_email_address(email):
+    """
+    Verify an email address by checking domain and mail server
+    Returns: (bool, str) - (is_valid, message)
+    """
+    # Get the domain name
+    domain = email.split('@')[1]
+    
+    try:
+        # Verify domain has MX record
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        mx_record = str(mx_records[0].exchange)
+        
+        # Verify server response
+        with smtplib.SMTP(timeout=MAX_TIMEOUT_SECONDS) as smtp:
+            smtp.connect(mx_record)
+            status = smtp.helo()[0]
+            if status != 250:
+                return False, "Server check failed"
+            return True, "Valid email"
+            
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        return False, "Domain does not exist"
+    except (socket.gaierror, socket.timeout, ConnectionRefusedError):
+        return False, "Server connection failed"
+    except smtplib.SMTPServerDisconnected:
+        return False, "Server disconnected"
+    except Exception as e:
+        return False, f"Verification failed: {str(e)}"
+
+def verify_emails_batch(emails):
+    """
+    Verify a batch of emails using parallel processing
+    """
+    valid_emails = set()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_email = {executor.submit(verify_email_address, email): email for email in emails}
+        for future in as_completed(future_to_email):
+            email = future_to_email[future]
+            try:
+                is_valid, message = future.result()
+                if is_valid:
+                    valid_emails.add(email)
+                else:
+                    print(f"[-] {email}: {message}")
+            except Exception as e:
+                print(f"[-] Error verifying {email}: {str(e)}")
+    
+    return valid_emails
+  
 def extract_emails(file, regex_emails, text:str, domain_emails:set, tlds):
   all_emails = set(regex_emails.findall(text))
-  parsend_emails = set()
+  parsed_emails = set()
   
   for email in all_emails:
     email = email.lower()
@@ -228,14 +282,22 @@ def extract_emails(file, regex_emails, text:str, domain_emails:set, tlds):
         tld = email[last_dot + 1:]
         if tld not in tlds:
           continue
-        
+
+      parsed_emails.add(email)
+  
+  # Verify the new batch of emails
+  if parsed_emails:
+    verified_emails = verify_emails_batch(parsed_emails)
+    
+    # Write only verified emails to file
+    for email in verified_emails:
       file.write(email + '\n')
-      parsend_emails.add(email)
+      domain_emails.add(email)
+    
+    file.flush()
   
-  file.flush()
-  
-  return parsend_emails
-          
+  return domain_emails
+        
 def parse_domain(domain:str, regex_emails, regex_robots, regex_href, headers:dict, tlds):
 
   session = Session()
