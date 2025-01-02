@@ -14,6 +14,7 @@ import os
 import warnings
 import urllib3
 warnings.simplefilter('ignore', urllib3.exceptions.InsecureRequestWarning)
+import argparse
 
 MAX_TIMEOUT_SECONDS = 6
 DOMAINS_FILE = 'domains.txt'
@@ -298,7 +299,7 @@ def extract_emails(file, regex_emails, text:str, domain_emails:set, tlds):
   
   return domain_emails
         
-def parse_domain(domain:str, regex_emails, regex_robots, regex_href, headers:dict, tlds):
+def parse_domain(domain:str, regex_emails, regex_robots, regex_href, headers:dict, tlds, initial_only=False):
 
   session = Session()
   
@@ -335,36 +336,60 @@ def parse_domain(domain:str, regex_emails, regex_robots, regex_href, headers:dic
   domain_emails = set()
   
   links = get_page_links(base_url, domain, main_resp, disallowed, regex_href)
+  print(f'[++] {base_url} {len(links)} initial links')
   
   try:
     f = open(f'{domain}_emails.txt', 'w')
+    f_links = open(f'{domain}_links.txt', 'w')
   except Exception as e:
     print(f'[-] {str(e)}')
     return False
   
   if links:
-    for link in links:
-  
-      if link in links_visited:
-        continue
-    
-      print(f'[+] {link}')
-      resp = do_get(session, link, None, headers)
-    
-      links_visited.add(link)
-      
-      if resp:
-        new_list = get_page_links(base_url, domain, resp, disallowed, regex_href)
-      
-        if new_list:
-          links.extend(new_list)
-          domain_emails.update(extract_emails(f, regex_emails, resp.text, domain_emails, tlds))
-        else:
-          #If page has no href links and it's an html page then search in it too.
+    if initial_only:
+      # Process only initial links without crawling deeper
+      for link in links:
+        f_links.write(link + '\n')
+        f_links.flush()
+        links_visited.add(link)
+        
+        resp = do_get(session, link, None, headers)
+        if resp:
           content_type = resp.headers.get('Content-Type')
           if content_type and content_type.startswith('text/html'):
             domain_emails.update(extract_emails(f, regex_emails, resp.text, domain_emails, tlds))
+    else:
+      # Original crawling behavior
+      for link in links:
     
+        if link in links_visited:
+          continue
+      
+        print(f'[+] {link}')
+        f_links.write(link + '\n')
+        f_links.flush()
+
+        resp = do_get(session, link, None, headers)
+      
+        links_visited.add(link)
+        
+        if resp:
+          new_list = get_page_links(base_url, domain, resp, disallowed, regex_href)
+          print(f'[++] {base_url} {len(new_list)} more links')
+        
+          if new_list:
+            links.extend(new_list)
+            for new_link in new_list:
+              if new_link not in all_links:
+                f_links.write(new_link + '\n')
+                f_links.flush()
+            domain_emails.update(extract_emails(f, regex_emails, resp.text, domain_emails, tlds))
+          else:
+            #If page has no href links and it's an html page then search in it too.
+            content_type = resp.headers.get('Content-Type')
+            if content_type and content_type.startswith('text/html'):
+              domain_emails.update(extract_emails(f, regex_emails, resp.text, domain_emails, tlds))
+      
   else:
     #If main page has no href links and it's an html page then search in it too.
     content_type = main_resp.headers.get('Content-Type')
@@ -372,7 +397,8 @@ def parse_domain(domain:str, regex_emails, regex_robots, regex_href, headers:dic
       domain_emails.update(extract_emails(f, regex_emails, main_resp.text, domain_emails, tlds))
     
   f.close()
-  print(f'[+] Extracted {len(domain_emails)} emails from {domain}')
+  f_links.close()
+  print(f'[+] Extracted {len(domain_emails)} emails and {len(links_visited)} links from {domain}')
   
   return True
 
@@ -421,15 +447,21 @@ def get_iana_tlds(regex_href):
   
 def process_single_domain(args):
     """Wrapper function to handle single domain processing for multiprocessing"""
-    domain, regex_pattern, regex_robots, regex_href, headers, tlds = args
+    domain, regex_pattern, regex_robots, regex_href, headers, tlds, initial_only = args
     try:
-        result = parse_domain(domain, regex_pattern, regex_robots, regex_href, headers, tlds)
+        result = parse_domain(domain, regex_pattern, regex_robots, regex_href, headers, tlds, initial_only)
         return domain, result
     except Exception as e:
         print(f"[-] Error processing domain {domain}: {str(e)}")
         return domain, False
 
 def main():
+    # Add argument parser
+    parser = argparse.ArgumentParser(description='Email and link scraper')
+    parser.add_argument('--initial-only', action='store_true', 
+                      help='Process only initial links without crawling deeper')
+    args = parser.parse_args()
+
     try:
         with open(DOMAINS_FILE, 'r') as f:
             domains = f.read().splitlines()
@@ -463,12 +495,14 @@ def main():
     # Prepare arguments for parallel processing
     process_args = []
     headers = get_headers()  # Get headers once
+    initial_only = args.initial_only
     
     for domain in unique_domains:
-        args = (domain, regex_pattern, regex_robots, regex_href, headers, tlds)
+        args = (domain, regex_pattern, regex_robots, regex_href, headers, tlds, initial_only)
         process_args.append(args)
     
     print(f"[+] Starting parallel processing with {MAX_PROCESSES} processes")
+    print(f"[+] Initial only mode: {initial_only}")
     
     # Create process pool and run domains in parallel
     with Pool(processes=MAX_PROCESSES) as pool:
